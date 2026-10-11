@@ -326,6 +326,11 @@
     font-family:'JetBrains Mono',monospace; font-size:10px; padding:6px 10px; cursor:pointer;
     min-height:36px; touch-action:manipulation;
   }
+  /* lives: drawn as pixel-art SVG hearts (a text glyph renders tiny / inconsistent on desktop fonts) */
+  .hearts{display:inline-flex; align-items:center; gap:5px;}
+  .heart{width:20px; height:18px; display:block; flex:0 0 auto; shape-rendering:crispEdges;}
+  .heart.on{color:var(--red); filter:drop-shadow(0 0 3px rgba(229,72,77,0.55));}
+  .heart.off{color:rgba(231,184,61,0.16);}
   .game-canvas-wrap{
     position:relative; flex:1 1 auto; min-height:0;
     background:#0a0b06; border:1px solid var(--hairline-soft);
@@ -1584,7 +1589,23 @@
     return apply;
   }
 
-  window.BCATS = { Audio8, Scores, GAMES, getPlayerName, askPlayerName, getPlayerAvatar, avatarImg, escapeHtml, goTo, fitCanvas, $, $$, clamp, rand, randi, Achievements, isDemoActive };
+  /* ===================== lives (pixel-art hearts) ===================== */
+  const HEART_BMP = ['.XX.XX.','XXXXXXX','XXXXXXX','.XXXXX.','..XXX..','...X...'];
+  const HEART_RECTS = (function(){
+    let out = '';
+    HEART_BMP.forEach((row,y)=>{ for(let x=0;x<row.length;x++){ if(row[x]==='X') out += '<rect x="'+x+'" y="'+y+'" width="1" height="1"/>'; } });
+    return out;
+  })();
+  function heartsHTML(n, max){
+    const total = Math.max(max||3, n);
+    let h = '';
+    for(let i=0;i<total;i++){
+      h += '<svg class="heart '+(i<n?'on':'off')+'" viewBox="0 0 7 6" fill="currentColor" aria-hidden="true">'+HEART_RECTS+'</svg>';
+    }
+    return '<span class="hearts" role="img" aria-label="Vidas: '+Math.max(0,n)+'">'+h+'</span>';
+  }
+
+  window.BCATS = { Audio8, Scores, GAMES, heartsHTML, getPlayerName, askPlayerName, getPlayerAvatar, avatarImg, escapeHtml, goTo, fitCanvas, $, $$, clamp, rand, randi, Achievements, isDemoActive };
 
 })();
 </script>
@@ -1602,7 +1623,7 @@
       '<div class="game-hud">' +
         '<span>PTS <span id="invScore">0</span></span>' +
         '<span id="invWave">OLEADA 1</span>' +
-        '<span id="invLives">♥ ♥ ♥</span>' +
+        '<span id="invLives">'+B.heartsHTML(3,3)+'</span>' +
       '</div>' +
       '<div class="game-canvas-wrap" id="invWrap">' +
         '<canvas id="invCanvas" width="'+RES_W+'" height="'+RES_H+'"></canvas>' +
@@ -1681,7 +1702,7 @@
     waveEl.textContent = 'OLEADA '+wave;
     paintLives();
   }
-  function paintLives(){ livesEl.textContent = '♥ '.repeat(Math.max(0,lives)).trim() || '—'; }
+  function paintLives(){ livesEl.innerHTML = B.heartsHTML(Math.max(0,lives), 3); }
 
   function onKey(e, down){
     if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') keys.left = down;
@@ -1888,7 +1909,7 @@
       '<div class="game-hud">' +
         '<span>PTS <span id="pgScore">0</span></span>' +
         '<span id="pgLevel">NIVEL 1</span>' +
-        '<span id="pgLives">♥ ♥ ♥</span>' +
+        '<span id="pgLives">'+B.heartsHTML(3,3)+'</span>' +
       '</div>' +
       '<div class="game-canvas-wrap" id="pgWrap">' +
         '<canvas id="pgCanvas" width="'+(COLS*CELL)+'" height="'+(ROWS*CELL)+'"></canvas>' +
@@ -2025,7 +2046,7 @@
     levelEl.textContent = 'NIVEL 1';
     paintLives();
   }
-  function paintLives(){ livesEl.textContent = '♥ '.repeat(Math.max(0,lives)).trim() || '—'; }
+  function paintLives(){ livesEl.innerHTML = B.heartsHTML(Math.max(0,lives), 3); }
 
   const keymap = { ArrowUp:[0,-1], ArrowDown:[0,1], ArrowLeft:[-1,0], ArrowRight:[1,0], w:[0,-1], s:[0,1], a:[-1,0], d:[1,0], W:[0,-1], S:[0,1], A:[-1,0], D:[1,0] };
   window.addEventListener('keydown', e=>{
