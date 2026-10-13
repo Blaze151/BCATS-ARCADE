@@ -338,6 +338,7 @@
     overflow:hidden; /* safety net: a canvas sized from a stale mobile-viewport
        reading must never visually spill past its own frame into the HUD/pad */
   }
+  #gmCanvas{box-shadow:0 0 14px rgba(247,216,121,0.35);}
   .game-canvas-wrap canvas{max-width:100%; max-height:100%; image-rendering:pixelated; touch-action:none; display:block; -webkit-touch-callout:none;}
   .game-hint{flex:0 0 auto; text-align:center; font-size:9.5px; color:var(--helper);}
   @media (max-width:520px){ .game-hint{ font-size:9px; } }
@@ -2654,7 +2655,7 @@
         '<span>PTS <span id="gmScore">0</span></span>' +
         '<span id="gmLevel">NIV 1</span>' +
         '<span id="gmLines">LÍN 0</span>' +
-        '<span style="display:flex; align-items:center; gap:6px;">SIG <canvas id="gmNext" width="16" height="16" style="width:26px;height:26px;image-rendering:pixelated;"></canvas></span>' +
+        '<span style="display:flex; align-items:center; gap:6px;">SIG <canvas id="gmNext" width="64" height="64" style="width:64px;height:64px;image-rendering:pixelated;"></canvas></span>' +
       '</div>' +
       '<div class="game-canvas-wrap" id="gmWrap">' +
         '<canvas id="gmCanvas" width="'+(COLS*CELL)+'" height="'+(ROWS*CELL)+'"></canvas>' +
@@ -2705,7 +2706,7 @@
   const TYPES = Object.keys(SHAPES);
 
   let board, bag, cur, score, level, lines, state;
-  let raf = null, lastT = 0, gravAcc = 0, softDrop = false;
+  let raf = null, lastT = 0, gravAcc = 0, softDrop = false, softLocked = false;
   let demoTimer = null;
 
   function newBag(){
@@ -2715,7 +2716,9 @@
   }
   function drawFromBag(){
     if(!bag.length) bag = newBag();
-    return bag.pop();
+    const t = bag.pop();
+    if(!bag.length) bag = newBag(); // keep the "next" preview always populated
+    return t;
   }
 
   function spawnPiece(type){
@@ -2741,10 +2744,13 @@
     cur = spawnPiece(drawFromBag());
     score = 0; level = 1; lines = 0;
     scoreEl.textContent='0'; levelEl.textContent='NIV 1'; linesEl.textContent='LÍN 0';
-    gravAcc = 0; softDrop = false;
+    gravAcc = 0; softDrop = false; softLocked = false;
   }
 
   function lockPiece(){
+    // a held ↓ must not drag the NEXT piece down: it has to be released and pressed again
+    if(softDrop) softLocked = true;
+    softDrop = false;
     cellsOf(cur).forEach(c=>{ if(c.y>=0) board[c.y][c.x] = SHAPES[cur.type].color; });
     let cleared = 0;
     for(let y=ROWS-1;y>=0;y--){
@@ -2816,30 +2822,42 @@
     if(state!=='playing') return;
     if(e.key==='ArrowLeft'){ tryMove(-1,0); e.preventDefault(); }
     else if(e.key==='ArrowRight'){ tryMove(1,0); e.preventDefault(); }
-    else if(e.key==='ArrowDown'){ softDrop = true; e.preventDefault(); }
+    else if(e.key==='ArrowDown'){ if(!softLocked) softDrop = true; e.preventDefault(); }
     else if(e.key==='ArrowUp' || e.key==='x' || e.key==='X'){ tryRotate(1); e.preventDefault(); }
     else if(e.key==='z' || e.key==='Z'){ tryRotate(-1); }
     else if((e.key===' '||e.key==='Spacebar') && !e.repeat){ hardDrop(); e.preventDefault(); }
   };
   window.addEventListener('keydown', keyHandler);
-  window.addEventListener('keyup', e=>{ if(e.key==='ArrowDown') softDrop=false; });
+  window.addEventListener('keyup', e=>{ if(e.key==='ArrowDown'){ softDrop=false; softLocked=false; } });
 
   function bindTap(id, fn){ document.getElementById(id).addEventListener('pointerdown', e=>{ e.preventDefault(); if(state==='playing') fn(); }); }
   bindTap('gmL', ()=>tryMove(-1,0));
   bindTap('gmR', ()=>tryMove(1,0));
   bindTap('gmRot', ()=>tryRotate(1));
   bindTap('gmDrop', hardDrop);
-  document.getElementById('gmDown').addEventListener('pointerdown', e=>{ e.preventDefault(); softDrop=true; });
-  ['pointerup','pointerleave','pointercancel'].forEach(ev=>document.getElementById('gmDown').addEventListener(ev, ()=>softDrop=false));
+  document.getElementById('gmDown').addEventListener('pointerdown', e=>{ e.preventDefault(); if(!softLocked) softDrop=true; });
+  ['pointerup','pointerleave','pointercancel'].forEach(ev=>document.getElementById('gmDown').addEventListener(ev, ()=>{ softDrop=false; softLocked=false; }));
 
   function drawNext(){
-    nctx.clearRect(0,0,16,16);
+    const NS = 16; // px per cell in the 64x64 preview (4 cells wide)
+    nctx.clearRect(0,0,64,64);
     if(!bag.length) return;
-    const t = bag[bag.length-1];
-    const sh = SHAPES[t];
+    const sh = SHAPES[bag[bag.length-1]];
     const cells = sh.rots[0];
-    nctx.fillStyle = sh.color;
-    cells.forEach(([r,c])=> nctx.fillRect(c*4, r*4, 3.5, 3.5));
+    // centre the piece inside the preview box
+    let minR=9,maxR=-1,minC=9,maxC=-1;
+    cells.forEach(([r,c])=>{ minR=Math.min(minR,r); maxR=Math.max(maxR,r); minC=Math.min(minC,c); maxC=Math.max(maxC,c); });
+    const ox = Math.round((64-(maxC-minC+1)*NS)/2) - minC*NS;
+    const oy = Math.round((64-(maxR-minR+1)*NS)/2) - minR*NS;
+    cells.forEach(([r,c])=>{
+      const x = ox+c*NS, y = oy+r*NS;
+      nctx.fillStyle = sh.color;
+      nctx.fillRect(x+1,y+1,NS-2,NS-2);
+      nctx.fillStyle = 'rgba(255,255,255,0.22)';
+      nctx.fillRect(x+1,y+1,NS-2,2);
+      nctx.fillStyle = 'rgba(0,0,0,0.28)';
+      nctx.fillRect(x+1,y+NS-3,NS-2,2);
+    });
   }
 
   function draw(){
@@ -2865,6 +2883,10 @@
       ctx.globalAlpha = 1;
       cellsOf(cur).forEach(c=>{ if(c.y>=0) drawBlock(c.x,c.y,SHAPES[cur.type].color); });
     }
+    // yellow frame so the play area stands out from the rest of the screen
+    ctx.strokeStyle = '#f7d879';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(0.75,0.75,W-1.5,H-1.5);
     drawNext();
   }
   function drawBlock(x,y,color){
@@ -2880,7 +2902,8 @@
     if(state!=='playing') return;
     const dt = Math.min(0.05,(t-lastT)/1000||0);
     lastT = t;
-    const interval = softDrop ? 0.045 : Math.max(0.09, 0.72-(level-1)*0.06);
+    const gravity = Math.max(0.09, 0.72-(level-1)*0.06);
+    const interval = softDrop ? Math.min(gravity, 0.11) : gravity; // soft drop: ~9 rows/s (was ~22)
     gravAcc += dt;
     while(gravAcc >= interval){
       gravAcc -= interval;
@@ -2911,7 +2934,7 @@
     },
     stop(){
       clearInterval(demoTimer); demoTimer = null;
-      if(raf) cancelAnimationFrame(raf); raf=null; softDrop=false;
+      if(raf) cancelAnimationFrame(raf); raf=null; softDrop=false; softLocked=false;
       if(state !== 'ready'){
         resetRun();
         state = 'ready';
