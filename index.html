@@ -2707,6 +2707,8 @@
 
   let board, bag, cur, score, level, lines, state;
   let raf = null, lastT = 0, gravAcc = 0, softDrop = false, softLocked = false;
+  let anim = null; // line-clear animation: { rows, t, phase } (phase 0 = vanish, 1 = stack falls)
+  const VANISH_T = 0.34, FALL_T = 0.26;
   let demoTimer = null;
 
   function newBag(){
@@ -2744,7 +2746,7 @@
     cur = spawnPiece(drawFromBag());
     score = 0; level = 1; lines = 0;
     scoreEl.textContent='0'; levelEl.textContent='NIV 1'; linesEl.textContent='LÍN 0';
-    gravAcc = 0; softDrop = false; softLocked = false;
+    gravAcc = 0; softDrop = false; softLocked = false; anim = null;
   }
 
   function lockPiece(){
@@ -2752,14 +2754,9 @@
     if(softDrop) softLocked = true;
     softDrop = false;
     cellsOf(cur).forEach(c=>{ if(c.y>=0) board[c.y][c.x] = SHAPES[cur.type].color; });
-    let cleared = 0;
-    for(let y=ROWS-1;y>=0;y--){
-      if(board[y].every(v=>v)){
-        board.splice(y,1);
-        board.unshift(new Array(COLS).fill(null));
-        cleared++; y++;
-      }
-    }
+    const fullRows = [];
+    for(let y=0;y<ROWS;y++){ if(board[y].every(v=>v)) fullRows.push(y); }
+    const cleared = fullRows.length;
     if(cleared){
       lines += cleared;
       const pts = [0,100,300,500,800][cleared] * level;
@@ -2771,19 +2768,40 @@
       const newLevel = 1+Math.floor(lines/8);
       if(newLevel!==level){ level=newLevel; levelEl.textContent='NIV '+level; }
       B.Audio8.sfx[cleared>=4?'win':'coin']();
-    } else {
-      B.Audio8.sfx.hit();
+      // hold the board while the rows vanish and the stack falls; the next piece spawns when it ends
+      anim = { rows: fullRows, t: 0, phase: 0 };
+      cur = null;
+      return;
     }
+    B.Audio8.sfx.hit();
     cur = spawnPiece(drawFromBag());
     if(!valid(cur)){ endGame(); }
   }
 
+  function finishClear(){
+    const gone = new Set(anim.rows);
+    const kept = board.filter((row,y)=>!gone.has(y));
+    while(kept.length < ROWS) kept.unshift(new Array(COLS).fill(null));
+    board = kept;
+    anim = null;
+    gravAcc = 0;
+    cur = spawnPiece(drawFromBag());
+    if(!valid(cur)){ endGame(); }
+  }
+  function stepAnim(dt){
+    anim.t += dt;
+    if(anim.phase===0 && anim.t >= VANISH_T){ anim.phase = 1; anim.t -= VANISH_T; }
+    if(anim.phase===1 && anim.t >= FALL_T){ finishClear(); }
+  }
+
   function tryMove(dx,dy){
+    if(!cur) return false;
     const np = { type:cur.type, rot:cur.rot, x:cur.x+dx, y:cur.y+dy };
     if(valid(np)){ cur = np; return true; }
     return false;
   }
   function tryRotate(dir){
+    if(!cur) return false;
     const nrot = (cur.rot + dir + 4) % 4;
     const kicks = [0,-1,1,-2,2];
     for(const k of kicks){
@@ -2793,6 +2811,7 @@
     return false;
   }
   function hardDrop(){
+    if(!cur) return;
     let d = 0;
     while(tryMove(0,1)) d++;
     score += d*2; scoreEl.textContent = score;
@@ -2871,8 +2890,12 @@
     for(let x=0;x<=COLS;x++){ ctx.beginPath(); ctx.moveTo(x*CELL,0); ctx.lineTo(x*CELL,H); ctx.stroke(); }
     for(let y=0;y<=ROWS;y++){ ctx.beginPath(); ctx.moveTo(0,y*CELL); ctx.lineTo(W,y*CELL); ctx.stroke(); }
 
-    for(let y=0;y<ROWS;y++) for(let x=0;x<COLS;x++){
-      if(board[y][x]){ drawBlock(x,y,board[y][x]); }
+    if(!anim){
+      for(let y=0;y<ROWS;y++) for(let x=0;x<COLS;x++){
+        if(board[y][x]){ drawBlock(x,y,board[y][x]); }
+      }
+    } else {
+      drawClearing();
     }
 
     if(cur){
@@ -2890,25 +2913,62 @@
     drawNext();
   }
   function drawBlock(x,y,color){
+    const px = x*CELL, py = Math.round(y*CELL); // y may be fractional while the stack falls
     ctx.fillStyle = color;
-    ctx.fillRect(x*CELL+1,y*CELL+1,CELL-2,CELL-2);
+    ctx.fillRect(px+1,py+1,CELL-2,CELL-2);
     ctx.fillStyle = 'rgba(255,255,255,0.22)';
-    ctx.fillRect(x*CELL+1,y*CELL+1,CELL-2,2);
+    ctx.fillRect(px+1,py+1,CELL-2,2);
     ctx.fillStyle = 'rgba(0,0,0,0.28)';
-    ctx.fillRect(x*CELL+1,y*CELL+CELL-3,CELL-2,2);
+    ctx.fillRect(px+1,py+CELL-3,CELL-2,2);
+  }
+  // line-clear animation: completed rows flash and shrink away from the centre outwards,
+  // then every row above them drops down (accelerating, like gravity) into the gap
+  function drawClearing(){
+    const gone = new Set(anim.rows);
+    if(anim.phase===0){
+      const p = Math.min(1, anim.t/VANISH_T);
+      for(let y=0;y<ROWS;y++) for(let x=0;x<COLS;x++){
+        const col = board[y][x]; if(!col) continue;
+        if(!gone.has(y)){ drawBlock(x,y,col); continue; }
+        const d = Math.abs(x-(COLS-1)/2)/((COLS-1)/2);          // 0 centre .. 1 edge
+        const local = Math.max(0, Math.min(1, (p - d*0.4)/0.6)); // edges start later
+        const flash = p < 0.25 ? (Math.floor(p*40)%2 ? 1 : 0.55) : 0.75*(1-local);
+        const sc = 1-local;
+        if(sc<=0.02) continue;
+        const cx = x*CELL+CELL/2, cy = y*CELL+CELL/2, hs = (CELL-2)*sc/2;
+        ctx.fillStyle = col;
+        ctx.fillRect(Math.round(cx-hs), Math.round(cy-hs), Math.max(1,Math.round(hs*2)), Math.max(1,Math.round(hs*2)));
+        ctx.fillStyle = 'rgba(255,248,214,'+flash+')';
+        ctx.fillRect(Math.round(cx-hs), Math.round(cy-hs), Math.max(1,Math.round(hs*2)), Math.max(1,Math.round(hs*2)));
+      }
+    } else {
+      const p = Math.min(1, anim.t/FALL_T);
+      const e = p*p;                                            // ease-in: accelerates like falling
+      for(let y=0;y<ROWS;y++){
+        if(gone.has(y)) continue;
+        let below = 0; anim.rows.forEach(r=>{ if(r>y) below++; });
+        const yy = y + below*e;
+        for(let x=0;x<COLS;x++){ if(board[y][x]) drawBlock(x,yy,board[y][x]); }
+      }
+    }
   }
 
   function loop(t){
     if(state!=='playing') return;
     const dt = Math.min(0.05,(t-lastT)/1000||0);
     lastT = t;
-    const gravity = Math.max(0.09, 0.72-(level-1)*0.06);
-    const interval = softDrop ? Math.min(gravity, 0.11) : gravity; // soft drop: ~9 rows/s (was ~22)
-    gravAcc += dt;
-    while(gravAcc >= interval){
-      gravAcc -= interval;
-      if(!tryMove(0,1)) lockPiece();
+    if(anim){
+      stepAnim(dt);
+    } else {
+      const gravity = Math.max(0.09, 0.72-(level-1)*0.06);
+      const interval = softDrop ? Math.min(gravity, 0.15) : gravity; // soft drop: ~6-7 rows/s (originally ~22)
+      gravAcc += dt;
+      while(gravAcc >= interval && !anim && state==='playing'){
+        gravAcc -= interval;
+        if(!tryMove(0,1)) lockPiece();
+      }
     }
+    if(state!=='playing') { draw(); return; }
     draw();
     raf = requestAnimationFrame(loop);
   }
