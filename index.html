@@ -1275,13 +1275,40 @@
       return Object.values(map).sort((a,b)=>b.score-a.score).slice(0,10);
     }
 
-    /* ---- global (cloud) ---- */
+    /* ---- global (cloud) ----
+       UNA fila global por dispositivo y por juego: la clave en la nube es un id
+       aleatorio de este navegador (no el nombre), asi que cambiar de nombre no
+       crea filas nuevas; solo se sube el mejor puntaje del dispositivo. */
     const cloud = {};            // game -> ultimo top 10 descargado
     let queue = Promise.resolve(); // envios en curso (para esperar antes de leer la tabla)
-    function syncedMap(){ try{ return JSON.parse(safeGet('bcats_cloud_synced','{}')) || {}; }catch(e){ return {}; } }
-    function markSynced(game, key, score){
-      const m = syncedMap(); (m[game] = m[game] || {})[key] = score;
-      safeSet('bcats_cloud_synced', JSON.stringify(m));
+    let memId = null;
+    function deviceId(){
+      if(memId) return memId;
+      let id = safeGet('bcats_device_id','');
+      if(!/^[a-z0-9]{12,40}$/.test(id)){
+        const abc = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        const rnd = new Uint8Array(24);
+        if(window.crypto && crypto.getRandomValues) crypto.getRandomValues(rnd);
+        else for(let i=0;i<rnd.length;i++) rnd[i] = Math.floor(Math.random()*256);
+        id = 'd'; for(let i=0;i<rnd.length;i++) id += abc[rnd[i]%36];
+        safeSet('bcats_device_id', id);
+      }
+      memId = id;
+      return id;
+    }
+    // mejor puntaje de este dispositivo en un juego (de todos los nombres usados)
+    function bestLocal(game){
+      let b = null;
+      Object.values(loadMap(game)).forEach(e=>{
+        if(e && typeof e.score==='number' && isFinite(e.score) && (!b || e.score > b.score)) b = e;
+      });
+      return b;
+    }
+    const SYNC_KEY = 'bcats_cloud_synced2';
+    function syncedMap(){ try{ return JSON.parse(safeGet(SYNC_KEY,'{}')) || {}; }catch(e){ return {}; } }
+    function markSynced(game, score){
+      const m = syncedMap(); m[game] = score;
+      safeSet(SYNC_KEY, JSON.stringify(m));
     }
     function cloudFetch(path, opts){
       const ctl = ('AbortController' in window) ? new AbortController() : null;
@@ -1291,24 +1318,32 @@
         e=>{ clearTimeout(timer); throw e; }
       );
     }
-    function cleanEntry(e){
+    function cleanEntry(e, id){
       if(!e || typeof e.name!=='string' || typeof e.score!=='number' || !isFinite(e.score)) return null;
-      return { name: e.name.slice(0,MAX_NAME), score: Math.floor(e.score), avatar: (typeof e.avatar==='number' ? e.avatar : 0), ts: (typeof e.ts==='number' ? e.ts : 0) };
+      return { id: id, name: e.name.slice(0,MAX_NAME), score: Math.floor(e.score), avatar: (typeof e.avatar==='number' ? e.avatar : 0), ts: (typeof e.ts==='number' ? e.ts : 0) };
     }
-    // sube un record si es mejor que lo ultimo que sabemos que esta en la nube
-    function pushIfNeeded(game, key, entry){
+    // sube el mejor puntaje del dispositivo si supera lo ultimo que sabemos que esta en la nube
+    function pushIfNeeded(game, entry){
       if(!CLOUD_ON || !entry) return Promise.resolve(false);
       const sc = Math.floor(entry.score);
       if(!(sc > 0) || sc > MAX_SCORE) return Promise.resolve(false);
-      const synced = (syncedMap()[game] || {})[key];
+      const synced = syncedMap()[game];
       if(typeof synced === 'number' && synced >= sc) return Promise.resolve(false);
+      const path = '/scores/'+game+'/'+deviceId()+'.json';
       const body = { name: String(entry.name||'PILOTO').slice(0,MAX_NAME), score: sc, avatar: entry.avatar|0, ts: (typeof entry.ts==='number' && entry.ts>0 ? entry.ts : Date.now()) };
-      return cloudFetch('/scores/'+game+'/'+key+'.json', { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
-        .then(()=>{ markSynced(game, key, sc); return true; })
+      return cloudFetch(path, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
+        .then(()=>{ markSynced(game, sc); return true; })
         .catch(err=>{
-          // 401 = las reglas rechazaron porque ya hay un puntaje igual o mayor para ese nombre
-          if(err && err.status===401){ markSynced(game, key, sc); }
-          else if(window.console) console.warn('[BCATS] no se pudo enviar el puntaje:', err && err.message);
+          if(err && err.status===401){
+            // 401 = reglas de Firebase: o ya hay un puntaje igual/mayor, o la escritura no cumple las reglas.
+            // Se comprueba cual de los dos para no dar por enviado algo que en realidad se rechazo.
+            return cloudFetch(path).then(cur=>{
+              if(cur && typeof cur.score==='number' && cur.score >= sc){ markSynced(game, cur.score); }
+              else if(window.console) console.warn('[BCATS] Firebase rechazo el puntaje: revisa las reglas de la base de datos.');
+              return false;
+            }).catch(()=>false);
+          }
+          if(window.console) console.warn('[BCATS] no se pudo enviar el puntaje:', err && err.message);
           return false;
         });
     }
@@ -1324,8 +1359,7 @@
         isRecord = true; // nuevo record personal
       }
       if(CLOUD_ON){
-        const best = map[key];
-        queue = queue.then(()=>pushIfNeeded(game, key, best)).catch(()=>{});
+        queue = queue.then(()=>pushIfNeeded(game, bestLocal(game))).catch(()=>{});
       }
       return isRecord;
     }
@@ -1333,7 +1367,7 @@
     function fetchGame(game){
       if(!CLOUD_ON) return Promise.reject(new Error('cloud off'));
       return cloudFetch('/scores/'+game+'.json?orderBy=%22score%22&limitToLast=10').then(data=>{
-        const rows = data ? Object.keys(data).map(k=>cleanEntry(data[k])).filter(Boolean) : [];
+        const rows = data ? Object.keys(data).map(k=>cleanEntry(data[k], k)).filter(Boolean) : [];
         rows.sort((a,b)=>b.score-a.score);
         cloud[game] = rows.slice(0,10);
         return cloud[game];
@@ -1343,8 +1377,7 @@
     function refresh(){
       if(!CLOUD_ON) return Promise.resolve(false);
       GAMES.forEach(g=>{
-        const map = loadMap(g.id);
-        Object.keys(map).forEach(key=>{ queue = queue.then(()=>pushIfNeeded(g.id, key, map[key])).catch(()=>{}); });
+        queue = queue.then(()=>pushIfNeeded(g.id, bestLocal(g.id))).catch(()=>{});
       });
       return queue.then(()=>Promise.all(GAMES.map(g=>fetchGame(g.id).then(()=>true, ()=>false)))).then(r=>r.some(Boolean));
     }
@@ -1355,7 +1388,7 @@
       const l = top(game);
       return l.length ? l[0] : null;
     }
-    return { submit, top, best, slugName, fetchGame, refresh, settled };
+    return { submit, top, best, slugName, fetchGame, refresh, settled, deviceId };
   })();
 
   /* ===================== player avatars ===================== */
@@ -1646,8 +1679,9 @@
       return;
     }
     const me = Scores.slugName(getPlayerName());
+    const myId = CLOUD_ON ? Scores.deviceId() : '';
     body.innerHTML = rows.map((r,i)=>{
-      const mine = highlightSelf && Scores.slugName(r.name)===me;
+      const mine = highlightSelf && (r.id ? r.id===myId : Scores.slugName(r.name)===me);
       return '<tr'+(mine?' style="background:rgba(231,184,61,0.12);"':'')+'><td>'+(i+1)+'</td><td>'+avatarImg(r.avatar||0,18)+' '+escapeHtml(r.name||'PILOTO')+(mine?' <span style="color:var(--gold-bright);">◀</span>':'')+'</td><td style="text-align:right;">'+r.score+'</td></tr>';
     }).join('');
   }
@@ -1685,7 +1719,7 @@
       Scores.settled().then(()=>Scores.fetchGame(currentScoreGame)).then(rows=>{
         if(req!==scoreReq) return;
         paintScoreRows(rows, true);
-        note.textContent = 'Tabla global: los mejores de todos los dispositivos. Un récord por nombre.';
+        note.textContent = 'Tabla global: los mejores de todos los dispositivos. Un solo récord por dispositivo.';
       }).catch(()=>{
         if(req!==scoreReq) return;
         paintScoreRows(Scores.top(currentScoreGame), true);
