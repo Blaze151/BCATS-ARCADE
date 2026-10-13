@@ -582,13 +582,14 @@
       <section class="screen scroll" id="screen-scores" style="gap:14px;">
         <div class="sec-title">TABLA DE PUNTUACIONES</div>
         <div class="score-tabs" id="scoreTabs"></div>
+        <div class="score-tabs" id="scoreScope" style="display:none;"></div>
         <div class="card-block">
           <table class="score-table">
             <thead><tr><th>#</th><th>PILOTO</th><th style="text-align:right;">PTS</th></tr></thead>
             <tbody id="scoreBody"><tr><td colspan="3" class="mono" style="color:var(--helper); padding:14px 8px;">Cargando…</td></tr></tbody>
           </table>
         </div>
-        <div class="mono" style="font-size:9.5px; color:var(--helper); text-align:center;">Mejores puntuaciones guardadas en este dispositivo.</div>
+        <div class="mono" id="scoreNote" style="font-size:9.5px; color:var(--helper); text-align:center;">Mejores puntuaciones guardadas en este dispositivo.</div>
         <div style="text-align:center;"><button class="btn-pixel ghost mono" data-goto="screen-hub">‹ VOLVER AL MENÚ</button></div>
       </section>
 
@@ -668,6 +669,7 @@
   </div>
 </div>
 
+<script src="config.js"></script>
 <script>
 (function(){
   "use strict";
@@ -1237,12 +1239,18 @@
     { id:'gatomino', name:'GATOMINO',        screen:'screen-gatomino' }
   ];
 
-  /* ===================== personal scoreboard (this device only) =====================
-     No servidor, no nube: cada quien ve solo lo que se guarda en su propio
-     navegador. Una fila por piloto (nombre) — un puntaje nuevo solo pisa el
-     anterior si es más alto, así que jugar de nuevo actualiza tu récord en
-     vez de amontonar partidas repetidas. */
+  /* ===================== scoreboard: local + global =====================
+     Local: cada dispositivo guarda su propia tabla (una fila por nombre; un
+     puntaje nuevo solo reemplaza al anterior si es mayor).
+     Global: si config.js trae la URL de una Realtime Database de Firebase,
+     cada record tambien se envia ahi (REST, sin librerias) y la pantalla de
+     puntuaciones lee el top 10 de todos los dispositivos. Si no hay URL, no
+     hay conexion o falla el servidor, todo sigue funcionando en modo local. */
+  const CLOUD_URL = String(window.BCATS_CLOUD_URL || '').trim().replace(/\/+$/,'');
+  const CLOUD_ON = /^https:\/\/[a-z0-9.-]+\.(firebaseio\.com|firebasedatabase\.app)$/i.test(CLOUD_URL);
+
   const Scores = (function(){
+    const MAX_SCORE = 1000000, MAX_NAME = 18;
     function localKey(game){ return 'bcats_scores_'+game; }
     function slugName(name){
       return String(name||'').trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_').slice(0,40) || 'PILOTO';
@@ -1266,19 +1274,88 @@
       const map = loadMap(game);
       return Object.values(map).sort((a,b)=>b.score-a.score).slice(0,10);
     }
+
+    /* ---- global (cloud) ---- */
+    const cloud = {};            // game -> ultimo top 10 descargado
+    let queue = Promise.resolve(); // envios en curso (para esperar antes de leer la tabla)
+    function syncedMap(){ try{ return JSON.parse(safeGet('bcats_cloud_synced','{}')) || {}; }catch(e){ return {}; } }
+    function markSynced(game, key, score){
+      const m = syncedMap(); (m[game] = m[game] || {})[key] = score;
+      safeSet('bcats_cloud_synced', JSON.stringify(m));
+    }
+    function cloudFetch(path, opts){
+      const ctl = ('AbortController' in window) ? new AbortController() : null;
+      const timer = setTimeout(()=>{ if(ctl) ctl.abort(); }, 7000);
+      return fetch(CLOUD_URL + path, Object.assign({ signal: ctl ? ctl.signal : undefined }, opts || {})).then(
+        r=>{ clearTimeout(timer); if(!r.ok){ const e = new Error('HTTP '+r.status); e.status = r.status; throw e; } return r.json(); },
+        e=>{ clearTimeout(timer); throw e; }
+      );
+    }
+    function cleanEntry(e){
+      if(!e || typeof e.name!=='string' || typeof e.score!=='number' || !isFinite(e.score)) return null;
+      return { name: e.name.slice(0,MAX_NAME), score: Math.floor(e.score), avatar: (typeof e.avatar==='number' ? e.avatar : 0), ts: (typeof e.ts==='number' ? e.ts : 0) };
+    }
+    // sube un record si es mejor que lo ultimo que sabemos que esta en la nube
+    function pushIfNeeded(game, key, entry){
+      if(!CLOUD_ON || !entry) return Promise.resolve(false);
+      const sc = Math.floor(entry.score);
+      if(!(sc > 0) || sc > MAX_SCORE) return Promise.resolve(false);
+      const synced = (syncedMap()[game] || {})[key];
+      if(typeof synced === 'number' && synced >= sc) return Promise.resolve(false);
+      const body = { name: String(entry.name||'PILOTO').slice(0,MAX_NAME), score: sc, avatar: entry.avatar|0, ts: (typeof entry.ts==='number' && entry.ts>0 ? entry.ts : Date.now()) };
+      return cloudFetch('/scores/'+game+'/'+key+'.json', { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
+        .then(()=>{ markSynced(game, key, sc); return true; })
+        .catch(err=>{
+          // 401 = las reglas rechazaron porque ya hay un puntaje igual o mayor para ese nombre
+          if(err && err.status===401){ markSynced(game, key, sc); }
+          else if(window.console) console.warn('[BCATS] no se pudo enviar el puntaje:', err && err.message);
+          return false;
+        });
+    }
     function submit(game, name, score, avatar){
       const map = loadMap(game);
       const key = slugName(name);
       const prev = map[key];
       const entry = {name:name, score:score, ts:Date.now(), avatar:avatar||0};
+      let isRecord = false;
       if(!prev || score > prev.score){
         map[key] = entry;
         safeSet(localKey(game), JSON.stringify(map));
-        return true; // nuevo récord personal
+        isRecord = true; // nuevo record personal
       }
-      return false;
+      if(CLOUD_ON){
+        const best = map[key];
+        queue = queue.then(()=>pushIfNeeded(game, key, best)).catch(()=>{});
+      }
+      return isRecord;
     }
-    return { submit, top };
+    function settled(){ return queue; }
+    function fetchGame(game){
+      if(!CLOUD_ON) return Promise.reject(new Error('cloud off'));
+      return cloudFetch('/scores/'+game+'.json?orderBy=%22score%22&limitToLast=10').then(data=>{
+        const rows = data ? Object.keys(data).map(k=>cleanEntry(data[k])).filter(Boolean) : [];
+        rows.sort((a,b)=>b.score-a.score);
+        cloud[game] = rows.slice(0,10);
+        return cloud[game];
+      });
+    }
+    // descarga el top de cada juego y sube lo que este dispositivo tenga pendiente
+    function refresh(){
+      if(!CLOUD_ON) return Promise.resolve(false);
+      GAMES.forEach(g=>{
+        const map = loadMap(g.id);
+        Object.keys(map).forEach(key=>{ queue = queue.then(()=>pushIfNeeded(g.id, key, map[key])).catch(()=>{}); });
+      });
+      return queue.then(()=>Promise.all(GAMES.map(g=>fetchGame(g.id).then(()=>true, ()=>false)))).then(r=>r.some(Boolean));
+    }
+    // mejor puntaje para mostrar en el menu: global si ya lo tenemos, si no el local
+    function best(game){
+      const c = cloud[game];
+      if(c && c.length) return c[0];
+      const l = top(game);
+      return l.length ? l[0] : null;
+    }
+    return { submit, top, best, slugName, fetchGame, refresh, settled };
   })();
 
   /* ===================== player avatars ===================== */
@@ -1522,6 +1599,14 @@
   function updateHubSelection(){
     $$('#cabinetGrid .cab-card').forEach((c,i)=> c.classList.toggle('selected', i===hubIndex));
   }
+  function bestLineFor(id){
+    const b = Scores.best(id);
+    return b ? ('MEJOR: '+b.score+' — '+escapeHtml(b.name)) : 'MEJOR: —';
+  }
+  function updateHubBest(){
+    if(currentScreen !== 'screen-hub') return;
+    $$('#cabinetGrid .cab-card .cab-best').forEach((el,i)=>{ if(GAMES[i]) el.innerHTML = bestLineFor(GAMES[i].id); });
+  }
   function renderHub(){
     const grid = $('#cabinetGrid');
     grid.innerHTML = '';
@@ -1529,8 +1614,7 @@
       const card = document.createElement('div');
       card.className = 'cab-card';
       card.setAttribute('data-goto', g.screen);
-      const rows = Scores.top(g.id);
-      const bestLine = rows.length ? ('MEJOR: '+rows[0].score+' — '+rows[0].name) : 'MEJOR: —';
+      const bestLine = bestLineFor(g.id);
       card.innerHTML =
         '<div class="cab-art">'+CAB_ART[g.id]+'</div>' +
         '<div class="cab-name">'+g.name+'</div>' +
@@ -1540,6 +1624,7 @@
     });
     hubIndex = 0;
     updateHubSelection();
+    if(CLOUD_ON) Scores.refresh().then(ok=>{ if(ok) updateHubBest(); });
   }
   window.addEventListener('keydown', (e)=>{
     if(currentScreen !== 'screen-hub') return;
@@ -1552,6 +1637,20 @@
 
   /* ===================== scores screen ===================== */
   let currentScoreGame = 'invasion';
+  let currentScoreScope = CLOUD_ON ? 'global' : 'local';
+  let scoreReq = 0;
+  function paintScoreRows(rows, highlightSelf){
+    const body = $('#scoreBody');
+    if(!rows || !rows.length){
+      body.innerHTML = '<tr><td colspan="3" class="mono" style="color:var(--helper); padding:14px 8px;">Aún no hay puntuaciones. ¡Sé el primero!</td></tr>';
+      return;
+    }
+    const me = Scores.slugName(getPlayerName());
+    body.innerHTML = rows.map((r,i)=>{
+      const mine = highlightSelf && Scores.slugName(r.name)===me;
+      return '<tr'+(mine?' style="background:rgba(231,184,61,0.12);"':'')+'><td>'+(i+1)+'</td><td>'+avatarImg(r.avatar||0,18)+' '+escapeHtml(r.name||'PILOTO')+(mine?' <span style="color:var(--gold-bright);">◀</span>':'')+'</td><td style="text-align:right;">'+r.score+'</td></tr>';
+    }).join('');
+  }
   function renderScoresScreen(){
     const tabs = $('#scoreTabs');
     tabs.innerHTML = '';
@@ -1562,15 +1661,40 @@
       b.addEventListener('click', ()=>{ currentScoreGame = g.id; renderScoresScreen(); });
       tabs.appendChild(b);
     });
-    const body = $('#scoreBody');
-    const rows = Scores.top(currentScoreGame);
-    if(!rows || !rows.length){
-      body.innerHTML = '<tr><td colspan="3" class="mono" style="color:var(--helper); padding:14px 8px;">Aún no hay puntuaciones. ¡Sé el primero!</td></tr>';
-      return;
+    const scope = $('#scoreScope');
+    scope.innerHTML = '';
+    scope.style.display = CLOUD_ON ? '' : 'none';
+    if(CLOUD_ON){
+      [['global','GLOBAL'],['local','ESTE DISPOSITIVO']].forEach(([id,label])=>{
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.className = id===currentScoreScope ? 'active':'';
+        b.addEventListener('click', ()=>{ currentScoreScope = id; renderScoresScreen(); });
+        scope.appendChild(b);
+      });
+      const r = document.createElement('button');
+      r.textContent = '↻'; r.title = 'Actualizar'; r.setAttribute('aria-label','Actualizar tabla');
+      r.addEventListener('click', ()=>renderScoresScreen());
+      scope.appendChild(r);
     }
-    body.innerHTML = rows.map((r,i)=>
-      '<tr><td>'+(i+1)+'</td><td>'+avatarImg(r.avatar||0,18)+' '+escapeHtml(r.name||'PILOTO')+'</td><td style="text-align:right;">'+r.score+'</td></tr>'
-    ).join('');
+    const note = $('#scoreNote');
+    const req = ++scoreReq;
+    if(CLOUD_ON && currentScoreScope==='global'){
+      $('#scoreBody').innerHTML = '<tr><td colspan="3" class="mono" style="color:var(--helper); padding:14px 8px;">Cargando tabla global…</td></tr>';
+      note.textContent = 'Conectando con la tabla global…';
+      Scores.settled().then(()=>Scores.fetchGame(currentScoreGame)).then(rows=>{
+        if(req!==scoreReq) return;
+        paintScoreRows(rows, true);
+        note.textContent = 'Tabla global: los mejores de todos los dispositivos. Un récord por nombre.';
+      }).catch(()=>{
+        if(req!==scoreReq) return;
+        paintScoreRows(Scores.top(currentScoreGame), true);
+        note.textContent = 'Sin conexión con la tabla global. Mostrando las puntuaciones de este dispositivo.';
+      });
+    } else {
+      paintScoreRows(Scores.top(currentScoreGame), false);
+      note.textContent = 'Mejores puntuaciones guardadas en este dispositivo.';
+    }
   }
   function escapeHtml(s){
     return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
