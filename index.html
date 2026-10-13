@@ -1304,6 +1304,7 @@
       });
       return b;
     }
+    let lastErr = null;          // ultimo motivo por el que fallo un envio (null = todo bien)
     const SYNC_KEY = 'bcats_cloud_synced2';
     function syncedMap(){ try{ return JSON.parse(safeGet(SYNC_KEY,'{}')) || {}; }catch(e){ return {}; } }
     function markSynced(game, score){
@@ -1332,17 +1333,18 @@
       const path = '/scores/'+game+'/'+deviceId()+'.json';
       const body = { name: String(entry.name||'PILOTO').slice(0,MAX_NAME), score: sc, avatar: entry.avatar|0, ts: (typeof entry.ts==='number' && entry.ts>0 ? entry.ts : Date.now()) };
       return cloudFetch(path, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
-        .then(()=>{ markSynced(game, sc); return true; })
+        .then(()=>{ markSynced(game, sc); lastErr = null; return true; })
         .catch(err=>{
           if(err && err.status===401){
             // 401 = reglas de Firebase: o ya hay un puntaje igual/mayor, o la escritura no cumple las reglas.
             // Se comprueba cual de los dos para no dar por enviado algo que en realidad se rechazo.
             return cloudFetch(path).then(cur=>{
-              if(cur && typeof cur.score==='number' && cur.score >= sc){ markSynced(game, cur.score); }
-              else if(window.console) console.warn('[BCATS] Firebase rechazo el puntaje: revisa las reglas de la base de datos.');
+              if(cur && typeof cur.score==='number' && cur.score >= sc){ markSynced(game, cur.score); lastErr = null; }
+              else { lastErr = 'Firebase rechazó el puntaje (revisa las reglas)'; if(window.console) console.warn('[BCATS] '+lastErr); }
               return false;
-            }).catch(()=>false);
+            }).catch(()=>{ lastErr = 'no se pudo conectar con Firebase'; return false; });
           }
+          lastErr = 'no se pudo conectar con Firebase (¿sin internet o bloqueado por una extensión/red?)';
           if(window.console) console.warn('[BCATS] no se pudo enviar el puntaje:', err && err.message);
           return false;
         });
@@ -1373,13 +1375,28 @@
         return cloud[game];
       });
     }
-    // descarga el top de cada juego y sube lo que este dispositivo tenga pendiente
-    function refresh(){
-      if(!CLOUD_ON) return Promise.resolve(false);
+    // sube el mejor puntaje de cada juego que aun no este en la nube
+    function syncPending(){
+      if(!CLOUD_ON) return Promise.resolve();
       GAMES.forEach(g=>{
         queue = queue.then(()=>pushIfNeeded(g.id, bestLocal(g.id))).catch(()=>{});
       });
-      return queue.then(()=>Promise.all(GAMES.map(g=>fetchGame(g.id).then(()=>true, ()=>false)))).then(r=>r.some(Boolean));
+      return queue;
+    }
+    // juegos cuyo mejor puntaje local todavia no esta confirmado en la nube
+    function status(){
+      const pending = [];
+      if(CLOUD_ON) GAMES.forEach(g=>{
+        const b = bestLocal(g.id); if(!b) return;
+        const sc = Math.floor(b.score), syn = syncedMap()[g.id];
+        if(sc > 0 && sc <= MAX_SCORE && !(typeof syn==='number' && syn >= sc)) pending.push(g.id);
+      });
+      return { pending: pending, err: lastErr };
+    }
+    // descarga el top de cada juego y sube lo que este dispositivo tenga pendiente
+    function refresh(){
+      if(!CLOUD_ON) return Promise.resolve(false);
+      return syncPending().then(()=>Promise.all(GAMES.map(g=>fetchGame(g.id).then(()=>true, ()=>false)))).then(r=>r.some(Boolean));
     }
     // mejor puntaje para mostrar en el menu: global si ya lo tenemos, si no el local
     function best(game){
@@ -1388,7 +1405,7 @@
       const l = top(game);
       return l.length ? l[0] : null;
     }
-    return { submit, top, best, slugName, fetchGame, refresh, settled, deviceId };
+    return { submit, top, best, slugName, fetchGame, refresh, settled, deviceId, syncPending, status };
   })();
 
   /* ===================== player avatars ===================== */
@@ -1716,16 +1733,25 @@
     if(CLOUD_ON && currentScoreScope==='global'){
       $('#scoreBody').innerHTML = '<tr><td colspan="3" class="mono" style="color:var(--helper); padding:14px 8px;">Cargando tabla global…</td></tr>';
       note.textContent = 'Conectando con la tabla global…';
-      Scores.settled().then(()=>Scores.fetchGame(currentScoreGame)).then(rows=>{
+      note.style.color = '';
+      Scores.syncPending().then(()=>Scores.fetchGame(currentScoreGame)).then(rows=>{
         if(req!==scoreReq) return;
         paintScoreRows(rows, true);
-        note.textContent = 'Tabla global: los mejores de todos los dispositivos. Un solo récord por dispositivo.';
+        const st = Scores.status();
+        if(st.pending.length){
+          note.style.color = 'var(--red)';
+          note.textContent = '⚠ Tu récord de este dispositivo aún no está en la tabla global: ' + (st.err || 'envío pendiente') + '. Pulsa ↻ para reintentar.';
+        } else {
+          note.textContent = 'Tabla global: los mejores de todos los dispositivos. Un solo récord por dispositivo.';
+        }
       }).catch(()=>{
         if(req!==scoreReq) return;
         paintScoreRows(Scores.top(currentScoreGame), true);
+        note.style.color = 'var(--red)';
         note.textContent = 'Sin conexión con la tabla global. Mostrando las puntuaciones de este dispositivo.';
       });
     } else {
+      note.style.color = '';
       paintScoreRows(Scores.top(currentScoreGame), false);
       note.textContent = 'Mejores puntuaciones guardadas en este dispositivo.';
     }
